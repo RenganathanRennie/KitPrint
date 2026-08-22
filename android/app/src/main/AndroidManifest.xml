@@ -9,7 +9,10 @@
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+    <!-- USB host support for iMin printers -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
 
     <application
       android:name=".MainApplication"

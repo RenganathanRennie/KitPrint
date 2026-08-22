@@ -14,16 +14,16 @@ import {
   AppStateStatus,
   Animated,
   BackHandler,
-  PermissionsAndroid,
-  Platform,
   TextInput,
+  Platform,
 } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import mqtt from 'mqtt';
 import { homeScreenStyles as styles } from '../styles/customStyles';
 import { FoodOrder } from '../types/FoodOrder';
-import { connectAndSubscribeMQTT, disconnectMQTT } from '../services/mqtt';
-import { printViaBluetooth, findBluetoothPrinters, isBluetoothEnabled, enableBluetooth } from '../services/bluetoothPrint';
+import { connectAndSubscribeMQTT } from '../services/mqtt';
+import * as IminPrinterService from '../services/iminPrinter';
+import * as UsbPrinterService from '../services/usbPrinter';
 import { useAppDispatch, useAppSelector } from '../redux/hooks';
 import {
   fetchOrders,
@@ -63,9 +63,10 @@ const HomeScreen: React.FC<HomeScreenProps> = ({ onLogout }) => {
   
   // Local state
   const [mainOrders, setMainOrders] = useState<FoodOrder[]>([]); // Master list for FlatList
-  const [printModalVisible, setPrintModalVisible] = useState(false);
-  const [selectedOrderForPrint, setSelectedOrderForPrint] = useState<FoodOrder | null>(null);
+  const [mqttPopupVisible, setMQTTPopupVisible] = useState(false);
+  const [mqttPopupOrder, setMQTTPopupOrder] = useState<FoodOrder | null>(null);
   const [expandedOrderId, setExpandedOrderId] = useState<number | null>(null);
+  
   const [isPrinting, setIsPrinting] = useState(false);
   const [userKeyModalVisible, setUserKeyModalVisible] = useState(false);
   const [userKeyInput, setUserKeyInput] = useState('');
@@ -134,12 +135,6 @@ const HomeScreen: React.FC<HomeScreenProps> = ({ onLogout }) => {
     setIsDarkMode((prev) => !prev);
   };
 
-  // Handle refresh with user key prompt
-  const handleRefreshWithKey = () => {
-    setUserKeyInput('');
-    setUserKeyModalVisible(true);
-  };
-
   // Submit user key
   const submitUserKey = () => {
     if (!userKeyInput || userKeyInput.trim() === '') {
@@ -158,62 +153,12 @@ const HomeScreen: React.FC<HomeScreenProps> = ({ onLogout }) => {
     }
 
     setUserKeyModalVisible(false);
-    dispatch(fetchOrders(parseInt(userKeyInput)));
+    dispatch(fetchOrders(userKeyInput));
     setUserKeyInput('');
   };
 
-  // Print receipt via Bluetooth or PDF
-  const printToBluetooth = async (receiptText: string, orderId: number): Promise<boolean> => {
-    try {
-      setIsPrinting(true);
-
-      // Check if Bluetooth is enabled
-      let btEnabled = await isBluetoothEnabled();
-      
-      if (!btEnabled) {
-        Alert.alert('Bluetooth Disabled', 'Enabling Bluetooth...', [
-          {
-            text: 'OK',
-            onPress: async () => {
-              const enabled = await enableBluetooth();
-              if (!enabled) {
-                throw new Error('Failed to enable Bluetooth');
-              }
-            },
-          },
-        ]);
-      }
-
-      // Find available printers
-      const printers = await findBluetoothPrinters();
-      
-      if (printers.length === 0) {
-        setIsPrinting(false);
-        return false; // No printers found, use PDF fallback
-      }
-
-      // Use first printer found (or could show selection dialog)
-      const selectedPrinter = printers[0];
-      
-      // Add line breaks for thermal printer formatting
-      const formattedReceipt = receiptText + '\n\n\n\n';
-      
-      // Print to Bluetooth printer
-      const success = await printViaBluetooth(selectedPrinter.address, formattedReceipt);
-      
-      setIsPrinting(false);
-      return success;
-    } catch (error) {
-      console.error('Bluetooth print error:', error);
-      setIsPrinting(false);
-      return false;
-    }
-  };
-
-  // Generate PDF as fallback
   const printToPDF = async (receiptText: string, orderId: number): Promise<boolean> => {
     try {
-      // Use Share to allow saving as PDF or printing
       await Share.share({
         message: receiptText,
         title: `Order Receipt ${orderId}`,
@@ -225,12 +170,175 @@ const HomeScreen: React.FC<HomeScreenProps> = ({ onLogout }) => {
     }
   };
 
-  // Handle print order with receipt preview
-  const handlePrint = (order: FoodOrder) => {
-    setSelectedOrderForPrint(order);
-    setPrintModalVisible(true);
+
+  const initUsbPrinter = useCallback(async (): Promise<boolean> => {
+    if (Platform.OS !== 'android') return false;
+    try {
+      await IminPrinterService.initPrinter();
+      return true;
+    } catch (e) {
+      console.error('init printer error', e);
+      return false;
+    }
+  }, []);
+
+  const printReceipt = async (receiptText: string, _orderId: number): Promise<boolean> => {
+    // Try vendor SDK first (native iMin)
+    try {
+      const sdkInit = await IminPrinterService.initPrinter();
+      if (sdkInit) {
+        await IminPrinterService.enterPrinterBuffer(true);
+        const formattedText = `${receiptText}\n\n`;
+        await IminPrinterService.printText(formattedText);
+        const result = await IminPrinterService.commitPrinterBuffer();
+        return result === 48;
+      }
+    } catch (e) {
+      console.warn('iMin SDK print failed, falling back to raw USB', e);
+    }
+
+    // Fallback: raw USB printing
+    try {
+      const devices = await UsbPrinterService.listUsbDevices();
+      if (!devices || devices.length === 0) {
+        console.warn('No USB devices found');
+        return false;
+      }
+      const first = devices[0];
+      const vendorId = first.vendorId;
+      const productId = first.productId;
+
+      const granted = await UsbPrinterService.requestPermission(vendorId, productId);
+      if (!granted) {
+        console.warn('USB permission denied');
+        return false;
+      }
+
+      const connected = await UsbPrinterService.connectPrinter(vendorId, productId);
+      if (!connected) {
+        console.warn('USB connect failed');
+        return false;
+      }
+
+      // convert text to bytes (simple UTF-8) then base64 encode
+      const printed = await UsbPrinterService.printEscPos(`${receiptText}`);
+      await UsbPrinterService.disconnect();
+      return !!printed;
+    } catch (err) {
+      console.error('USB fallback print error', err);
+      return false;
+    }
   };
-const formatDate = (dateString: string) => {
+
+  useEffect(() => {
+    initUsbPrinter();
+  }, [initUsbPrinter]);
+
+  // Handle print order immediately without extra touches
+  const handlePrint = async (order: FoodOrder) => {
+    await confirmPrint(order);
+  };
+
+  const createReceiptText = (order: FoodOrder) => {
+    return `
+TechNow Software
+123 Main Street, City, Country
++65 81805352
+------------------------------------------------
+
+Order No. ${order.orderId}
+Order Date ${formatDate(order.createdAt)}
+------------------------------------------------
+Customer Info
+
+Customer Name : ${order.customerName ?? ''}
+Mobile        : ${order.phone ?? ''}
+Delivery Address:
+------------------------------------------------
+${order.address ?? ''}
+------------------------------------------------
+
+Item                    Qty     Amount
+------------------------------------------------
+${order.orderDetails
+      .map(
+        item =>
+          `${item.itemName.padEnd(20)} ${item.quantity.toString().padEnd(5)} ${item.itemTotal.toFixed(2)}`,
+      )
+      .join('\n')}
+
+------------------------------------------------
+TOTAL: $${order.invoiceTotal.toFixed(2)}
+------------------------------------------------
+
+Payment By: ${order.paymentMethod}
+
+------------------------------------------------
+Thank you for your visit!
+`;
+  };
+
+  const addMQTTOrderToList = (order: FoodOrder) => {
+    setMQTTPopupVisible(false);
+    setMQTTPopupOrder(null);
+    setMainOrders((prev) => {
+      const exists = prev.some((o) => o.orderId === order.orderId);
+      if (exists) return prev;
+      return [...prev, order];
+    });
+    dispatch(updateOrderFromMQTT(order));
+  };
+
+  const handleMQTTPopupPrint = async (order: FoodOrder) => {
+    try {
+      setMQTTPopupVisible(false);
+      setMQTTPopupOrder(null);
+
+      const receiptText = createReceiptText(order);
+
+      setIsPrinting(true);
+      const printSuccess = await printReceipt(receiptText, order.orderId);
+      setIsPrinting(false);
+
+      if (!printSuccess) {
+        setMainOrders((prev) => {
+          const existingIndex = prev.findIndex((o) => o.orderId === order.orderId);
+          if (existingIndex > -1) {
+            const updated = [...prev];
+            updated[existingIndex] = order;
+            return updated;
+          }
+          return [...prev, order];
+        });
+        dispatch(updateOrderFromMQTT(order));
+        Alert.alert('Printer Error', 'Could not print order. The order was added to the list.');
+        return;
+      }
+
+      const result = await dispatch(updateOrderStatusAsync({ orderId: order.orderId, status: 'Printed' }));
+      if (result.meta.requestStatus === 'fulfilled') {
+        Alert.alert('Print Successful', 'MQTT order printed immediately.');
+      } else {
+        Alert.alert('Warning', 'Order printed but status update failed.');
+      }
+    } catch (error: any) {
+      console.error('MQTT print error:', error);
+      setIsPrinting(false);
+      setMainOrders((prev) => {
+        const existingIndex = prev.findIndex((o) => o.orderId === order.orderId);
+        if (existingIndex > -1) {
+          const updated = [...prev];
+          updated[existingIndex] = order;
+          return updated;
+        }
+        return [...prev, order];
+      });
+      dispatch(updateOrderFromMQTT(order));
+      Alert.alert('Printer Error', 'Failed to print MQTT order. The order was added to the list.');
+    }
+  };
+
+  const formatDate = (dateString: string) => {
   const d = new Date(dateString);
 
   return (
@@ -252,8 +360,8 @@ const formatDate = (dateString: string) => {
     try {
       const itemsList = order.orderDetails
         .map((item) => `• ${item.itemName} (Qty: ${item.quantity}) - $${item.itemTotal.toFixed(2)}`)
-        .join('\n');       
-console.log('afsdfsd', formatDate(order.createdAt));
+        .join('\n');
+      console.log('Printing order at', formatDate(order.createdAt));
       const receiptText = `
 TechNow Software
 123 Main Street, City, Country
@@ -274,14 +382,7 @@ ${order.address ?? ''}
 
 Item                    Qty     Amount
 ------------------------------------------------
-${order.orderDetails
-  .map(
-    item =>
-      `${item.itemName.padEnd(20)} ${item.quantity
-        .toString()
-        .padEnd(5)} ${item.itemTotal.toFixed(2)}`
-  )
-  .join('\n')}
+${itemsList}
 
 ------------------------------------------------
 TOTAL: $${order.invoiceTotal.toFixed(2)}
@@ -293,68 +394,39 @@ Payment By: ${order.paymentMethod}
 Thank you for your visit!
 `;
 
-      setPrintModalVisible(false);
-
-      // Attempt Bluetooth printing
+      // Attempt system printing immediately
       setIsPrinting(true);
-      const bluetoothSuccess = await printToBluetooth(receiptText, order.orderId);
+      const printSuccess = await printReceipt(receiptText, order.orderId);
       setIsPrinting(false);
 
-      if (bluetoothSuccess) {
-  Alert.alert(
-    'Print Successful',
-    'Receipt printed successfully.',
-    [
-      {
-        text: 'Reprint',
-        onPress: () => {
-          confirmPrint(order);
-        },
-      },
-      {
-        text: 'Close',
-        onPress: async () => {
-          setPrintModalVisible(false);
-
-          setMainOrders((prev) =>
-            prev.filter((o) => o.orderId !== order.orderId)
-          );
-
-          await dispatch(
-            updateOrderStatusAsync({
-              orderId: order.orderId,
-              status: 'Printed',
-            })
-          );
-        },
-      },
-    ]
-  );
-} else {
-        // Fallback to PDF/Share if Bluetooth fails
-        Alert.alert('Bluetooth Failed', 'Printer not found. Using alternate print method...', [
-          {
-            text: 'Print as PDF',
-            onPress: async () => {
-              const pdfSuccess = await printToPDF(receiptText, order.orderId);
-              
-              if (pdfSuccess) {
-                // Remove from mainOrders immediately and update status
-                setMainOrders((prev) => prev.filter((o) => o.orderId !== order.orderId));
-                await dispatch(updateOrderStatusAsync({ orderId: order.orderId, status: 'Printed' }));
-                Alert.alert('Success', 'Receipt shared and status updated to Printed');
-              } else {
-                Alert.alert('Error', 'Failed to process print request');
-              }
-            },
-            style: 'default',
-          },
-          {
-            text: 'Cancel',
-            style: 'cancel',
-          },
-        ]);
+      if (printSuccess) {
+        setMainOrders((prev) => prev.filter((o) => o.orderId !== order.orderId));
+        await dispatch(
+          updateOrderStatusAsync({
+            orderId: order.orderId,
+            status: 'Printed',
+          }),
+        );
+        return;
       }
+
+      Alert.alert('Printer Error', 'Could not print order. It will remain in the list.', [
+        {
+          text: 'Print as PDF',
+          onPress: async () => {
+            const pdfSuccess = await printToPDF(receiptText, order.orderId);
+            if (pdfSuccess) {
+              Alert.alert('Success', 'Receipt shared. The order remains in the list for retry.');
+            } else {
+              Alert.alert('Error', 'Failed to process print request. The order remains in the list.');
+            }
+          },
+        },
+        {
+          text: 'OK',
+          style: 'cancel',
+        },
+      ]);
     } catch (err: any) {
       console.error('Print error:', err);
       setIsPrinting(false);
@@ -413,40 +485,6 @@ Thank you for your visit!
     ]);
   };
 
-  // Animate order removal with pop effect
-  const animateRemoval = (orderId: number) => {
-    if (!animationRefs.current[orderId]) {
-      animationRefs.current[orderId] = new Animated.Value(1);
-    }
-    if (!heightAnimationRefs.current[orderId]) {
-      heightAnimationRefs.current[orderId] = new Animated.Value(150); // Initial height estimate
-    }
-
-    Animated.sequence([
-      // Pop out animation
-      Animated.parallel([
-        Animated.timing(animationRefs.current[orderId], {
-          toValue: 1.2,
-          duration: 150,
-          useNativeDriver: true,
-        }),
-      ]),
-      // Fade, scale out, and collapse height
-      Animated.parallel([
-        Animated.timing(animationRefs.current[orderId], {
-          toValue: 0,
-          duration: 200,
-          useNativeDriver: true,
-        }),
-        Animated.timing(heightAnimationRefs.current[orderId], {
-          toValue: 0,
-          duration: 200,
-          useNativeDriver: false,
-        }),
-      ]),
-    ]).start();
-  };
-
   // Initialize on mount
   useEffect(() => {
     const initializeApp = async () => {
@@ -455,18 +493,10 @@ Thank you for your visit!
         const onMQTTMessage = (topic: string, newOrder: FoodOrder) => {
           console.log('📲 MQTT message received on topic:', topic);
           console.log('Order data:', newOrder);
-          
-          // Add to mainOrders only if not already present
-          setMainOrders((prevOrders) => {
-            const exists = prevOrders.some((o) => o.orderId === newOrder.orderId);
-            if (!exists) {
-              return [...prevOrders, newOrder];
-            }
-            return prevOrders;
-          });
-          
-          // Also update Redux for consistency
-          dispatch(updateOrderFromMQTT(newOrder));
+
+          // Update MQTT popup whenever a new MQTT message arrives
+          setMQTTPopupOrder(newOrder);
+          setMQTTPopupVisible(true);
         };
 
         const onMQTTError = (error: Error) => {
@@ -755,192 +785,103 @@ Thank you for your visit!
       />
 
       {/* Print Receipt Modal */}
+      {/* MQTT Popup Modal */}
       <Modal
-        visible={printModalVisible}
+        visible={mqttPopupVisible}
         transparent={true}
-        animationType="slide"
-        onRequestClose={() => setPrintModalVisible(false)}
+        animationType="fade"
+        onRequestClose={() => setMQTTPopupVisible(false)}
       >
         <View style={styles.modalContainer}>
-          <View
-            style={[styles.printModal, isDarkMode && styles.darkPrintModal]}
-          >
+          <View style={[styles.printModal, isDarkMode && styles.darkPrintModal]}>            
             <View style={styles.receiptHeader}>
               <View>
-                <Text style={styles.receiptTitle}>🖨️ KITPRINT</Text>
-                <Text style={styles.receiptSubtitle}>Receipt</Text>
+                <Text style={styles.receiptTitle}>📩 New MQTT Order</Text>
+                <Text style={styles.receiptSubtitle}>Tap X to add to list, or Print Now</Text>
               </View>
               <TouchableOpacity
-                onPress={() => setPrintModalVisible(false)}
+                onPress={() => mqttPopupOrder && addMQTTOrderToList(mqttPopupOrder)}
                 style={styles.closeBtn}
               >
                 <Text style={styles.closeBtnText}>✕</Text>
               </TouchableOpacity>
             </View>
 
-            {selectedOrderForPrint && (
+            {mqttPopupOrder ? (
               <ScrollView style={styles.receiptContent}>
-                {selectedOrderForPrint && (
-                  <View style={{ padding: 15 }}>
-                    <Text
-                      style={{
-                        textAlign: 'center',
-                        fontSize: 18,
-                        fontWeight: 'bold',
-                      }}
-                    >
-                      TechNow Software
-                    </Text>
+                <View style={{ padding: 15 }}>
+                  <Text style={{ fontWeight: '700', marginBottom: 8 }}>
+                    Order #{mqttPopupOrder.orderId}
+                  </Text>
+                  <Text style={{ marginBottom: 4 }}>
+                    Table: {mqttPopupOrder.tableName || 'N/A'}
+                  </Text>
+                  <Text style={{ marginBottom: 4 }}>
+                    Customer: {mqttPopupOrder.customerName || 'Guest'}
+                  </Text>
+                  <Text style={{ marginBottom: 4 }}>
+                    Phone: {mqttPopupOrder.phone || 'N/A'}
+                  </Text>
+                  <Text style={{ marginBottom: 4 }}>
+                    Total: ${mqttPopupOrder.invoiceTotal?.toFixed(2) ?? '0.00'}
+                  </Text>
+                  <Text style={{ marginBottom: 4 }}>
+                    Status: {getStatusLabel(mqttPopupOrder.status)}
+                  </Text>
+                  <Text style={{ marginBottom: 4 }}>
+                    Received: {new Date(mqttPopupOrder.createdAt).toLocaleString()}
+                  </Text>
 
-                    <Text style={{ textAlign: 'center' }}>
-                      123 Main Street, City, Country
-                    </Text>
-
-                    <Text style={{ textAlign: 'center' }}>+65 81805352</Text>
-
-                    <Text>
-                      ------------------------------------------------
-                    </Text>
-
-                    <Text>Order No. {selectedOrderForPrint.orderId}</Text>
-
-                    <Text>
-                      Order Date{' '}
-                      {new Date(
-                        selectedOrderForPrint.createdAt,
-                      ).toLocaleString()}
-                    </Text>
-
-                    <Text>
-                      ------------------------------------------------
-                    </Text>
-
-                    <Text style={{ fontWeight: 'bold' }}>Customer Info</Text>
-
-                    <Text>
-                      Customer Name: {selectedOrderForPrint.customerName || ''}
-                    </Text>
-
-                    <Text>Mobile: {selectedOrderForPrint.phone || ''}</Text>
-
-                    <Text>Delivery Address:</Text>
-
-                    <Text>{selectedOrderForPrint.address || ''}</Text>
-
-                    <Text>
-                      ------------------------------------------------
-                    </Text>
-
+                  <Text style={{ marginTop: 12, fontWeight: '700' }}>
+                    Items
+                  </Text>
+                  {mqttPopupOrder.orderDetails.map((item, index) => (
                     <View
+                      key={index}
                       style={{
                         flexDirection: 'row',
                         justifyContent: 'space-between',
-                        marginBottom: 8,
+                        marginTop: 4,
                       }}
                     >
-                      <Text style={{ flex: 3, fontWeight: 'bold' }}>Item</Text>
-
-                      <Text style={{ flex: 1, fontWeight: 'bold' }}>Qty</Text>
-
-                      <Text style={{ flex: 1, fontWeight: 'bold' }}>
-                        Amount
+                      <Text style={{ flex: 2 }}>{item.itemName}</Text>
+                      <Text style={{ flex: 1, textAlign: 'center' }}>
+                        {item.quantity}
+                      </Text>
+                      <Text style={{ flex: 1, textAlign: 'right' }}>
+                        ${item.itemTotal.toFixed(2)}
                       </Text>
                     </View>
-
-                    <Text>
-                      ------------------------------------------------
-                    </Text>
-
-                    {selectedOrderForPrint.orderDetails.map((item, index) => (
-                      <View
-                        key={index}
-                        style={{
-                          flexDirection: 'row',
-                          justifyContent: 'space-between',
-                          marginVertical: 2,
-                        }}
-                      >
-                        <Text style={{ flex: 3 }}>{item.itemName}</Text>
-
-                        <Text style={{ flex: 1 }}>{item.quantity}</Text>
-
-                        <Text style={{ flex: 1 }}>
-                          ${item.itemTotal.toFixed(2)}
-                        </Text>
-                      </View>
-                    ))}
-
-                    <Text>-----------------------------------------------</Text>
-
-                    <View
-                      style={{
-                        flexDirection: 'row',
-                        justifyContent: 'space-between',
-                      }}
-                    >
-                      <Text
-                        style={{
-                          fontWeight: 'bold',
-                          fontSize: 18,
-                        }}
-                      >
-                        TOTAL:
-                      </Text>
-
-                      <Text
-                        style={{
-                          fontWeight: 'bold',
-                          fontSize: 18,
-                        }}
-                      >
-                        ${selectedOrderForPrint.invoiceTotal.toFixed(2)}
-                      </Text>
-                    </View>
-
-                    <Text>-----------------------------------------------</Text>
-
-                    <Text>
-                      Payment By: {selectedOrderForPrint.paymentMethod}
-                    </Text>
-
-                    <Text>-----------------------------------------------</Text>
-
-                    <Text
-                      style={{
-                        textAlign: 'center',
-                        marginTop: 10,
-                        fontWeight: '600',
-                      }}
-                    >
-                      Thank you for your visit!
-                    </Text>
-                  </View>
-                )}
+                  ))}
+                </View>
               </ScrollView>
+            ) : (
+              <View style={{ padding: 15 }}>
+                <Text>No MQTT order available.</Text>
+              </View>
             )}
 
             <View style={styles.printModalButtons}>
               <TouchableOpacity
                 style={[styles.printModalBtn, styles.cancelModalBtn]}
-                onPress={() => setPrintModalVisible(false)}
+                onPress={() => mqttPopupOrder && addMQTTOrderToList(mqttPopupOrder)}
               >
                 <Text style={[styles.printModalBtnText, styles.cancelBtnText]}>
-                  Cancel
+                  Add to List
                 </Text>
               </TouchableOpacity>
 
               <TouchableOpacity
                 style={[styles.printModalBtn, styles.confirmPrintBtn]}
-                onPress={() => confirmPrint(selectedOrderForPrint!)}
+                onPress={() => mqttPopupOrder && handleMQTTPopupPrint(mqttPopupOrder)}
               >
-                <Text style={styles.printModalBtnText}>🖨️ Print</Text>
+                <Text style={styles.printModalBtnText}>🖨️ Print Now</Text>
               </TouchableOpacity>
             </View>
           </View>
         </View>
       </Modal>
 
-      {/* User Key Modal */}
       <Modal
         visible={userKeyModalVisible}
         transparent={true}

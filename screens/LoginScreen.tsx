@@ -5,6 +5,7 @@ import {
   TouchableOpacity,
   Alert,
   ActivityIndicator,
+  TextInput,
 } from 'react-native';
 import ReactNativeBiometrics from 'react-native-biometrics';
 import { loginScreenStyles as styles } from '../styles/customStyles';
@@ -13,9 +14,13 @@ interface LoginScreenProps {
   onLogin: () => void;
 }
 
+const LOCAL_PIN = '1234';
+
 const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin }) => {
   const [loading, setLoading] = useState(false);
   const [isBiometricAvailable, setIsBiometricAvailable] = useState(false);
+  const [pin, setPin] = useState('');
+  const [pinError, setPinError] = useState('');
 
   useEffect(() => {
     checkBiometricAvailability();
@@ -78,6 +83,25 @@ const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin }) => {
     }
   };
 
+  const handlePinLogin = () => {
+    if (loading) {
+      return;
+    }
+
+    if (!pin.trim()) {
+      setPinError('Please enter your PIN.');
+      return;
+    }
+
+    if (pin !== LOCAL_PIN) {
+      setPinError('Invalid PIN. Please try again.');
+      return;
+    }
+
+    setPinError('');
+    onLogin();
+  };
+
   return (
     <View style={styles.container}>
       <View style={styles.content}>
@@ -85,6 +109,29 @@ const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin }) => {
         <Text style={styles.subtitle}>Welcome Back</Text>
 
         {loading && <ActivityIndicator size="large" color="#007AFF" style={styles.loader} />}
+
+        <TextInput
+          style={styles.pinInput}
+          placeholder="Enter PIN"
+          secureTextEntry
+          keyboardType="numeric"
+          maxLength={6}
+          value={pin}
+          onChangeText={(text) => {
+            setPin(text);
+            setPinError('');
+          }}
+          editable={!loading}
+          placeholderTextColor="#999"
+        />
+        <TouchableOpacity
+          style={styles.pinButton}
+          onPress={handlePinLogin}
+          disabled={loading}
+        >
+          <Text style={styles.pinButtonText}>Login with PIN</Text>
+        </TouchableOpacity>
+        {pinError ? <Text style={styles.errorText}>{pinError}</Text> : null}
 
         {isBiometricAvailable && (
           <TouchableOpacity
@@ -96,11 +143,9 @@ const LoginScreen: React.FC<LoginScreenProps> = ({ onLogin }) => {
           </TouchableOpacity>
         )}
 
-      
-
         {!isBiometricAvailable && (
           <Text style={styles.warningText}>
-            Biometric authentication not available on this device
+            Biometric authentication not available on this device. Use PIN to login.
           </Text>
         )}
       </View>

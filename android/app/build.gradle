@@ -57,7 +57,7 @@ react {
 /**
  * Set this to true to Run Proguard on Release builds to minify the Java bytecode.
  */
-def enableProguardInReleaseBuilds = false
+def enableProguardInReleaseBuilds = true
 
 /**
  * The preferred build flavor of JavaScriptCore (JSC)
@@ -102,6 +102,7 @@ android {
             // see https://reactnative.dev/docs/signed-apk-android.
             signingConfig signingConfigs.debug
             minifyEnabled enableProguardInReleaseBuilds
+            shrinkResources true
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
     }
@@ -116,4 +117,12 @@ dependencies {
     } else {
         implementation jscFlavor
     }
+
+    // To integrate the iMin Printer SDK, place the required JAR file(s)
+    // (for example V1.1.0_2307141412.jar) into android/app/libs/
+    // and add a dependency like:
+    // implementation files('libs/V1.1.0_2307141412.jar')
+    // Also ensure any transitive dependencies required by the JAR are added.
+    // Include any JARs placed in android/app/libs automatically
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
 }
